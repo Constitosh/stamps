@@ -5,7 +5,7 @@ import helmet from 'helmet';
 import morgan from 'morgan';
 import fs from 'fs';
 import path from 'path';
-import LRU from 'lru-cache';
+import { LRUCache } from 'lru-cache';
 import { BlockFrostAPI } from '@blockfrost/blockfrost-js';
 
 const app = express();
@@ -24,16 +24,33 @@ app.use(morgan('tiny'));
 
 /* --- files --- */
 const ROOT = process.cwd();
-const DB_FILE = path.join(ROOT, 'db.json');
+const DB_FILE  = path.join(ROOT, 'db.json');
 const VAR_FILE = path.join(ROOT, 'variants.json');
+const INDEX_FILE = path.join(ROOT, 'meta_index.json'); // optional local index by asset name
 
 if (!fs.existsSync(DB_FILE)) fs.writeFileSync(DB_FILE, JSON.stringify({ wallets: {} }, null, 2));
 const variants = JSON.parse(fs.readFileSync(VAR_FILE, 'utf8'));
 const variantByKey = new Map(variants.map(v => [v.key, v]));
 
+/* --- optional local metadata index (by asset name) --- */
+let NAME_INDEX = null; // { "FAMILY_001": { variant, name, image, traits:{...} } ... }
+
+function loadNameIndex() {
+  if (!fs.existsSync(INDEX_FILE)) { NAME_INDEX = null; return; }
+  try {
+    const arr = JSON.parse(fs.readFileSync(INDEX_FILE, 'utf8'));
+    NAME_INDEX = Object.fromEntries(arr.map(r => [String(r.name), r]));
+    console.log(`Loaded meta_index.json with ${arr.length} rows.`);
+  } catch (e) {
+    console.warn('Failed to load meta_index.json:', e.message);
+    NAME_INDEX = null;
+  }
+}
+loadNameIndex();
+
 /* --- caches --- */
-const accCache  = new LRU({ max: 500,  ttl: 1000*60*5  });  // 5 min
-const infoCache = new LRU({ max: 5000, ttl: 1000*60*60 });  // 1 hour
+const accCache  = new LRUCache({ max: 500,  ttl: 1000 * 30 });        // stake -> asset rows (30s)
+const infoCache = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 });   // unit  -> metadata (1h)
 
 /* --- helpers --- */
 const hexToAscii = (hex) => {
@@ -45,6 +62,19 @@ const ipfs = (u) => u && u.startsWith('ipfs://') ? 'https://cloudflare-ipfs.com/
 
 const readDB  = () => JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
 const writeDB = (d) => fs.writeFileSync(DB_FILE, JSON.stringify(d, null, 2));
+
+/**
+ * Accept stake1… or addr1… and convert to stake address for Blockfrost account endpoints.
+ */
+async function toStakeAddress(maybe) {
+  if (!maybe) return null;
+  if (maybe.startsWith('stake1')) return maybe;
+  if (maybe.startsWith('addr1')) {
+    const info = await api.addresses(maybe);
+    return info?.stake_address || null;
+  }
+  return null;
+}
 
 function matchVariant(v, info) {
   // A) attributes.slot
@@ -64,7 +94,7 @@ function extractNumber(info, fallbackUnitTail = true) {
   const attrs = info.onchain_metadata?.attributes || {};
   if (attrs.STAMP != null) return String(attrs.STAMP);
 
-  // else try suffix of name: FAMILY_### or FAMILY_## 
+  // else try suffix of name: FAMILY_### or FAMILY_####
   const ascii = hexToAscii(info.asset_name || '');
   const m = ascii.match(/_(\d{1,4})$/);
   if (m) return m[1];
@@ -73,10 +103,27 @@ function extractNumber(info, fallbackUnitTail = true) {
   return '';
 }
 
+/** Try to resolve from local NAME_INDEX (by ASCII asset name) */
+function resolveFromLocalByName(asciiName) {
+  if (!NAME_INDEX) return null;
+  const row = NAME_INDEX[asciiName];
+  if (!row) return null;
+  const image = row.image?.startsWith('ipfs://') ? 'https://cloudflare-ipfs.com/ipfs/' + row.image.slice(7) : row.image;
+  const number = row.traits?.STAMP || (asciiName.match(/_(\d{1,4})$/)?.[1] ?? '');
+  const traitFlags = Object.keys(row.traits || {}).map(k => String(k).toLowerCase());
+  return {
+    variantKey: row.variant,
+    name: asciiName,
+    image,
+    number,
+    traitFlags,
+  };
+}
+
 /* --- core: compute holdings --- */
-async function computeHoldings(stake) {
-  // 1) list all assets under this account
-  let rows = accCache.get(stake);
+async function computeHoldings(stake, { force = false } = {}) {
+  // 1) list all assets under this account (stake address)
+  let rows = !force ? accCache.get(stake) : null;
   if (!rows) {
     rows = await api.accountsAddressesAssets(stake, { count: 100, page: 1 });
     let page = 1;
@@ -92,7 +139,7 @@ async function computeHoldings(stake) {
   const units = rows
     .map(r => r.asset || r.unit)
     .filter(Boolean)
-    .filter(u => POLICY_ID ? u.startsWith(POLICY_ID) : true);
+    .filter(u => (POLICY_ID ? u.startsWith(POLICY_ID) : true));
 
   // 3) tallies per variant
   const tallies = {};
@@ -102,25 +149,34 @@ async function computeHoldings(stake) {
     let info = infoCache.get(unit);
     if (!info) { info = await api.assetsById(unit); infoCache.set(unit, info); }
 
+    // Prefer local index by asset_name if available
+    const ascii = hexToAscii(info.asset_name || '');
+    const local = resolveFromLocalByName(ascii);
+
     for (const v of variants) {
-      if (!matchVariant(v, info)) continue;
+      const familyMatch =
+        (local && local.variantKey?.toUpperCase() === v.key.toUpperCase())
+        || matchVariant(v, info);
+
+      if (!familyMatch) continue;
 
       const t = tallies[v.key];
       t.count += 1;
 
+      // trait flags
       const attrs = info.onchain_metadata?.attributes || {};
-      // auto-detect a few booleans/names used in your UI; normalize to lowercase keys
       const detected = [];
       if (attrs.blood || /blood/i.test(String(attrs.trait || ''))) detected.push('blood');
       if (attrs.coffee || /coffee/i.test(String(attrs.trait || ''))) detected.push('coffee');
       if (attrs.flip   || attrs.flipped || /flip/i.test(String(attrs.trait || ''))) detected.push('flip');
       if (attrs.laser  || /laser/i.test(String(attrs.trait || ''))) detected.push('laser');
-
-      // include variant-level always-on icons if defined
+      // include local traits + variant-level always-on icons
       const fixed = Array.isArray(v.traitIcons) ? v.traitIcons : [];
-      [...detected, ...fixed].forEach(x => t.traitFlags.add(String(x).toLowerCase()));
+      [...detected, ...(local?.traitFlags || []), ...fixed]
+        .forEach(x => t.traitFlags.add(String(x).toLowerCase()));
 
-      const img = ipfs(info.onchain_metadata?.image || info.metadata?.image);
+      // sample image
+      const img = local?.image || ipfs(info.onchain_metadata?.image || info.metadata?.image);
       if (!t.sampleImage && img) t.sampleImage = img;
     }
   }
@@ -134,14 +190,28 @@ async function computeHoldings(stake) {
 /* --- routes --- */
 app.get('/health', (_req, res) => res.json({ ok: true, policy: POLICY_ID ? 'set' : 'unset' }));
 
+/** expose variants.json so the frontend can read config if needed */
+app.get('/variants', (_req, res) => res.json(variants));
+
+/** reload local meta index without restart */
+app.post('/index/reload', (_req, res) => {
+  loadNameIndex();
+  res.json({ ok: true, rows: NAME_INDEX ? Object.keys(NAME_INDEX).length : 0 });
+});
+
 /**
- * GET /holdings/:stake
- * -> { policy, variants: [{key, name?, cluster?, count, revealed, sampleImage, traitFlags}] }
+ * GET /holdings/:addr
+ * Accepts stake1… OR addr1…; returns:
+ * { policy, variants: [{key, name?, cluster?, count, revealed, sampleImage, traitFlags}] }
  */
-app.get('/holdings/:stake', async (req, res) => {
+app.get('/holdings/:addr', async (req, res) => {
   try {
-    const stake = req.params.stake;
-    const { tallies } = await computeHoldings(stake);
+    const raw = req.params.addr;
+    const force = String(req.query.force || '0') === '1';
+    const stake = await toStakeAddress(raw);
+    if (!stake) return res.status(400).json({ error: 'bad_address', detail: 'Need stake1… or addr1…' });
+
+    const { tallies } = await computeHoldings(stake, { force });
 
     const db = readDB();
     const now = new Date().toISOString();
@@ -167,12 +237,16 @@ app.get('/holdings/:stake', async (req, res) => {
 });
 
 /**
- * GET /assets/:stake/:variantKey
+ * GET /assets/:addr/:variantKey
  * -> { variant, items: [{ unit, name, image, number }] }
+ * Accepts stake1… OR addr1…
  */
-app.get('/assets/:stake/:variantKey', async (req, res) => {
+app.get('/assets/:addr/:variantKey', async (req, res) => {
   try {
-    const { stake, variantKey } = req.params;
+    const { addr, variantKey } = req.params;
+    const stake = await toStakeAddress(addr);
+    if (!stake) return res.status(400).json({ error: 'bad_address' });
+
     const v = variantByKey.get(variantKey);
     if (!v) return res.status(404).json({ error: 'unknown_variant' });
 
@@ -182,13 +256,21 @@ app.get('/assets/:stake/:variantKey', async (req, res) => {
     for (const unit of units) {
       let info = infoCache.get(unit);
       if (!info) { info = await api.assetsById(unit); infoCache.set(unit, info); }
-      if (!matchVariant(v, info)) continue;
+
+      // prefer local mapping by asset_name
+      const asciiName = hexToAscii(info.asset_name || '');
+      const local = resolveFromLocalByName(asciiName);
+      const familyMatch =
+        (local && local.variantKey?.toUpperCase() === v.key.toUpperCase())
+        || matchVariant(v, info);
+
+      if (!familyMatch) continue;
 
       items.push({
         unit,
-        name: hexToAscii(info.asset_name || '') || info.asset_name,
-        image: ipfs(info.onchain_metadata?.image || info.metadata?.image),
-        number: extractNumber(info)
+        name: local?.name || asciiName || info.asset_name,
+        image: local?.image || ipfs(info.onchain_metadata?.image || info.metadata?.image),
+        number: local?.number || extractNumber(info)
       });
     }
     res.json({ variant: v.key, items });
@@ -202,18 +284,21 @@ app.get('/assets/:stake/:variantKey', async (req, res) => {
  * POST /reveal
  * body: { stake, variantKey }
  * persists a “revealed” flag for this wallet + variant
+ * (stake may be stake1… or addr1…; we normalize and persist by stake address)
  */
-app.post('/reveal', (req, res) => {
-  const { stake, variantKey } = req.body || {};
+app.post('/reveal', async (req, res) => {
+  let { stake, variantKey } = req.body || {};
   if (!stake || !variantKey) return res.status(400).json({ error: 'missing_params' });
+  const stakeAddr = await toStakeAddress(stake);
+  if (!stakeAddr) return res.status(400).json({ error: 'bad_address' });
   if (!variantByKey.has(variantKey)) return res.status(404).json({ error: 'unknown_variant' });
 
   const db = readDB();
   const now = new Date().toISOString();
-  const rec = db.wallets[stake] || { reveals: [], first_seen: now };
+  const rec = db.wallets[stakeAddr] || { reveals: [], first_seen: now };
   if (!rec.reveals.includes(variantKey)) rec.reveals.push(variantKey);
   rec.last_seen = now;
-  db.wallets[stake] = rec;
+  db.wallets[stakeAddr] = rec;
   writeDB(db);
 
   res.json({ ok: true, reveals: rec.reveals });
