@@ -1,0 +1,234 @@
+<style>
+/* ---------- TILE LOOK ---------- */
+.stamp-tile{position:relative;width:190px;height:190px;border-radius:16px;cursor:pointer;user-select:none}
+.stamp-img{position:absolute;inset:10px;border-radius:14px;width:calc(100% - 20px);height:calc(100% - 20px);object-fit:cover}
+
+/* Frame: NONE by default; only show on revealable/revealed states */
+.stamp-frame{position:absolute;inset:0;border-radius:16px;background:transparent;box-shadow:none}
+.state-revealable .stamp-frame{
+  background:rgba(255,255,255,.02);
+  box-shadow:0 0 0 2px rgba(169,120,255,.60) inset,0 0 26px rgba(169,120,255,.40)
+}
+.state-revealed:not(.has-special) .stamp-frame{
+  background:rgba(255,255,255,.02);
+  box-shadow:0 0 0 1px rgba(255,255,255,.14) inset
+}
+.state-revealed.has-special .stamp-frame{
+  background:rgba(255,0,0,.06);
+  box-shadow:0 0 0 2px rgba(255,80,80,.75) inset,0 0 30px rgba(255,40,40,.55),0 0 60px rgba(255,40,40,.35)
+}
+
+/* Rings for multiples (1+/2+/3+) */
+.ring-1::after,.ring-2::before{content:"";position:absolute;border-radius:20px;pointer-events:none}
+.ring-1::after{inset:-6px;box-shadow:0 0 0 3px rgba(185,95,255,.55)}
+.ring-2::before{inset:-12px;box-shadow:0 0 0 6px rgba(255,220,80,.5)}
+.ring-3{outline:6px solid rgba(0,200,255,.45);outline-offset:-18px}
+
+/* Labels */
+.stamp-title{position:absolute;top:-22px;left:0;right:0;text-align:center;font:800 12px/1.1 system-ui;letter-spacing:.08em;color:#f3d7a6;text-transform:uppercase;text-shadow:0 1px 0 #0007}
+.stamp-count{position:absolute;top:-10px;right:-10px;width:36px;height:36px;border-radius:50%;display:none;place-items:center;background:#21c17a;color:#032;font:800 14px/1 system-ui;box-shadow:0 4px 16px #0008}
+.stamp-num{position:absolute;bottom:-18px;left:0;right:0;text-align:center;font:700 12px system-ui;color:#eebf86;text-shadow:0 1px 0 #0008}
+
+/* Trait icons rail (left) */
+.traits{display:none;position:absolute;left:-14px;top:28px;flex-direction:column;gap:8px}
+.state-revealed.has-special .traits{display:flex}
+.trait{width:28px;height:28px;border-radius:9px;background:#2a1f16;display:grid;place-items:center;box-shadow:0 2px 8px #0008}
+.trait[data-t="coffee"]{background:#2a1f16 url('/icons/coffee.png') center/18px 18px no-repeat}
+.trait[data-t="blood"] {background:#2a1f16 url('/icons/blood.png') center/18px 18px no-repeat}
+.trait[data-t="laser"] {background:#2a1f16 url('/icons/laser.png') center/18px 18px no-repeat}
+
+/* Hold-to-reveal bar */
+.holdbar{position:absolute;left:10px;right:10px;bottom:10px;height:6px;border-radius:3px;background:#0008;overflow:hidden;display:none}
+.holdbar>i{display:block;height:100%;width:0;background:#b97dff}
+
+/* Hover zoom (revealed) */
+.zoom{position:absolute;z-index:50;left:200px;bottom:0;width:240px;height:240px;border-radius:14px;overflow:hidden;background:#000;box-shadow:0 16px 32px #000a;transform:scale(.001);transform-origin:left bottom;transition:transform .08s}
+.state-revealed:hover .zoom{transform:scale(1)}
+.zoom img{width:100%;height:100%;object-fit:cover}
+
+/* Placeholder art on page (off-chain UI images you upload to Webflow Assets) */
+.placeholder-empty{background:#1b1b1b url('/images/placeholder-stamp.png') center/cover no-repeat}
+</style>
+
+<!-- ONE TILE -->
+<div class="stamp-tile state-empty"
+     id="tile-0.2-LASERS"
+     data-variant="0.2-LASERS"
+     data-title="0.2-LASERS"
+     data-placeholder="/images/placeholder-stamp.png">
+  <div class="stamp-title">0.2-LASERS</div>
+  <div class="stamp-count">+1</div>
+  <div class="traits"></div>
+  <div class="stamp-frame"></div>
+  <img class="stamp-img" src="/images/placeholder-stamp.png" alt="">
+  <div class="holdbar"><i></i></div>
+  <div class="zoom"><img src="/images/placeholder-stamp.png" alt=""></div>
+  <div class="stamp-num"></div>
+</div>
+
+<script>
+/** ======== CONFIG (change base URL + trait list as you like) ======== **/
+const BACKEND_BASE = "https://stamp.thefakerug.com";
+const HOLD_SECONDS = 1.6;
+const SPECIAL_TRAITS = new Set(['coffee','blood','laser']); // traits that trigger red glow when revealed
+
+// OPTIONAL: if you want signed-proof, set this true and create /auth endpoints later
+const REQUIRE_PROOF = false;
+
+/** ======== tiny shared context for the page ======== **/
+window.stampsCtx = window.stampsCtx || {
+  stake: null,
+  token: null, // optional auth token if you add signature-based auth later
+};
+
+// Utility: IPFS → gateway
+const ipfs = u => u?.startsWith('ipfs://') ? 'https://cloudflare-ipfs.com/ipfs/' + u.slice(7) : u;
+
+// CIP-30 connect (simple)
+async function enableAnyWallet(){
+  const w = ["nami","eternl","flint","lace","gerowallet"];
+  for (const k of w) if (window.cardano?.[k]) return { name:k, api: await window.cardano[k].enable() };
+  throw new Error("No Cardano wallet found.");
+}
+
+// OPTIONAL: proof of ownership (challenge → sign → verify). Safe to skip if not implemented.
+async function maybeAuthWithSignature(api, stake) {
+  if (!REQUIRE_PROOF) return null;
+  try {
+    // ask backend for a challenge:
+    const ch = await fetch(`${BACKEND_BASE}/auth/challenge?stake=${encodeURIComponent(stake)}`).then(r=>r.json());
+    // sign with wallet (CIP-30 signData; not all wallets support it)
+    if (!api.signData) return null;
+    const signed = await api.signData(stake, ch.challenge); // adjust address if needed (some wallets require payment key, not stake)
+    const ver = await fetch(`${BACKEND_BASE}/auth/verify`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ stake, challenge: ch.challenge, signature: signed })
+    }).then(r=>r.json());
+    return ver?.token || null;
+  } catch { return null; }
+}
+
+// Public function: call this from your Connect button
+window.stampsConnect = async function(){
+  try {
+    const { api } = await enableAnyWallet();
+    const rewards = await api.getRewardAddresses();
+    if (!rewards?.length) throw new Error("No reward (stake) address.");
+    const stake = rewards[0];
+    window.stampsCtx.stake = stake;
+    window.stampsCtx.token = await maybeAuthWithSignature(api, stake);
+    // Once connected, initialize every tile on the page
+    document.querySelectorAll('.stamp-tile').forEach(el => attachTile(el, stake));
+  } catch (e) {
+    console.error(e);
+    alert(e.message || "Wallet connect failed.");
+  }
+};
+
+/** ======== Single-tile logic ======== **/
+async function attachTile(el, stake){
+  const variant = el.dataset.variant;
+  const title   = el.dataset.title || variant;
+  const ph      = el.dataset.placeholder || '/images/placeholder-stamp.png';
+  el.querySelector('.stamp-title').textContent = title;
+  const imgEl  = el.querySelector('.stamp-img');
+  const zoomEl = el.querySelector('.zoom img');
+  imgEl.src = ph; zoomEl.src = ph;
+
+  // Fetch holdings summary for the whole collection (one call)
+  const headers = window.stampsCtx.token ? { 'Authorization': 'Bearer ' + window.stampsCtx.token } : {};
+  const h = await fetch(`${BACKEND_BASE}/holdings/${encodeURIComponent(stake)}`, { headers }).then(r=>r.json());
+  const v = (h.variants || []).find(x => x.key === variant) || { count:0, revealed:false, traitFlags:[] };
+  const count = v.count|0;
+
+  // State classes
+  el.classList.remove('state-empty','state-revealable','state-revealed','ring-1','ring-2','ring-3','has-special');
+  if (v.revealed) el.classList.add('state-revealed');
+  else if (count>0) el.classList.add('state-revealable');
+  else el.classList.add('state-empty');
+
+  if (count>=3) el.classList.add('ring-1','ring-2','ring-3');
+  else if (count===2) el.classList.add('ring-1','ring-2');
+  else if (count===1) el.classList.add('ring-1');
+
+  const badge = el.querySelector('.stamp-count');
+  badge.style.display = count>0 ? 'grid' : 'none';
+  if (count>0) badge.textContent = `+${count}`;
+
+  // If owned, pull one asset for this family to show image + number + trait icons
+  const numEl = el.querySelector('.stamp-num');
+  const traitsEl = el.querySelector('.traits');
+  traitsEl.innerHTML = '';
+  let hasSpecial = false;
+
+  if (count>0){
+    const a = await fetch(`${BACKEND_BASE}/assets/${encodeURIComponent(stake)}/${encodeURIComponent(variant)}`, { headers }).then(r=>r.json());
+    const first = a.items?.[0];
+    if (first?.image){ imgEl.src = ipfs(first.image); zoomEl.src = ipfs(first.image); }
+    // number: prefer metadata STAMP, else suffix after "_", else tail of unit
+    let n = (first?.number) || '';
+    if (!n && first?.name){ const m = first.name.match(/_(\d{1,4})$/); if (m) n = m[1]; }
+    if (!n && first?.unit) n = first.unit.slice(56);
+    numEl.textContent = n || '';
+
+    // trait icons (max 3) from backend summary
+    (v.traitFlags || []).slice(0,3).forEach(t=>{
+      const key = String(t).toLowerCase();
+      const i = document.createElement('div'); i.className='trait'; i.dataset.t=key; traitsEl.appendChild(i);
+      if (SPECIAL_TRAITS.has(key)) hasSpecial = true;
+    });
+  } else {
+    numEl.textContent = '';
+  }
+
+  el.classList.toggle('has-special', v.revealed && hasSpecial);
+
+  // Press & hold to reveal
+  const bar = el.querySelector('.holdbar'); const fill = bar.querySelector('i');
+  let raf=null;
+  const startHold = ()=>{
+    if (!el.classList.contains('state-revealable') || v.revealed) return;
+    bar.style.display='block'; const t0=performance.now();
+    const step=now=>{
+      const p=Math.min(1,(now-t0)/(HOLD_SECONDS*1000));
+      fill.style.width=(p*100)+'%';
+      if (p<1) raf=requestAnimationFrame(step); else finishReveal();
+    };
+    raf=requestAnimationFrame(step);
+  };
+  const cancelHold = ()=>{ if(raf) cancelAnimationFrame(raf); bar.style.display='none'; fill.style.width='0%'; };
+  const finishReveal = async ()=>{
+    cancelHold();
+    const r = await fetch(`${BACKEND_BASE}/reveal`, {
+      method:'POST',
+      headers: { 'Content-Type':'application/json', ...(headers||{}) },
+      body: JSON.stringify({ stake, variantKey: variant })
+    });
+    if (r.ok){
+      el.classList.remove('state-revealable'); el.classList.add('state-revealed');
+      // If you want to refresh after reveal to reflect "special" glow: call attachTile again or set classes here.
+    }
+  };
+  el.addEventListener('pointerdown', startHold, { passive:true });
+  el.addEventListener('pointerup', cancelHold);
+  el.addEventListener('pointerleave', cancelHold);
+
+  // Click → list all copies (hook up your modal here later)
+  el.addEventListener('click', async ()=>{
+    if (!el.classList.contains('state-revealed') || count<1) return;
+    const a = await fetch(`${BACKEND_BASE}/assets/${encodeURIComponent(stake)}/${encodeURIComponent(variant)}`, { headers }).then(r=>r.json());
+    console.log('Owned in', variant, a.items);
+    // TODO: open modal + render a.items (name, number, image)
+  }, { passive:true });
+}
+
+/* Optional convenience: wire up a button with id="wallet-connect" */
+document.addEventListener('DOMContentLoaded', ()=>{
+  const btn = document.getElementById('wallet-connect');
+  if (btn) btn.addEventListener('click', ()=> window.stampsConnect());
+  // If user already connected earlier in the session, auto-init tile:
+  if (window.stampsCtx.stake) {
+    document.querySelectorAll('.stamp-tile').forEach(el => attachTile(el, window.stampsCtx.stake));
+  }
+});
+</script>
