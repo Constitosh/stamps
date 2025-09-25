@@ -5,36 +5,23 @@ import helmet from 'helmet';
 import morgan from 'morgan';
 import fs from 'fs';
 import path from 'path';
-import crypto from 'crypto';
-import jwt from 'jsonwebtoken';
-import { bech32 } from 'bech32';
 import { LRUCache } from 'lru-cache';
 import { BlockFrostAPI } from '@blockfrost/blockfrost-js';
-import Cardano from '@emurgo/cardano-serialization-lib-nodejs';
+import { bech32 } from 'bech32';
 
 const app = express();
 
-/* ── config ── */
+/* ── ENV / CONFIG ─────────────────────────────────────────────── */
 const PORT        = Number(process.env.PORT || 3005);
-const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
+const CORS_ORIGIN = process.env.CORS_ORIGIN || '*'; // e.g. "https://old-money.webflow.io,https://preview.webflow.com"
 const NETWORK_ID  = Number(process.env.NETWORK_ID || 1); // 1 mainnet, 0 testnet
-const POLICY_ID   = (process.env.POLICY_ID || '').trim();
-const JWT_SECRET  = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
-const AUTH_TTL    = Number(process.env.AUTH_TTL_SECONDS || 3600);
-const STRICT_AUTH = process.env.STRICT_AUTH === '1'; // default off
+const POLICY_ID   = (process.env.POLICY_ID || '').trim(); // 56-hex (mainnet policy)
+const api         = new BlockFrostAPI({ projectId: process.env.BLOCKFROST_KEY });
 
-const api = new BlockFrostAPI({ projectId: process.env.BLOCKFROST_KEY });
-
-/* ── middleware ── */
-/* --- CORS (replace your old app.use(cors(...)) with this) --- */
-const origins = (process.env.CORS_ORIGIN || '*')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
-
+/* ── CORS (allow only your Webflow origins) ───────────────────── */
+const origins = CORS_ORIGIN.split(',').map(s => s.trim()).filter(Boolean);
 app.use(cors({
   origin(origin, cb) {
-    // allow server-to-server/no-Origin and any whitelisted origin
     if (!origin) return cb(null, true);
     if (origins.includes('*') || origins.includes(origin)) return cb(null, true);
     return cb(new Error('CORS blocked'), false);
@@ -43,29 +30,29 @@ app.use(cors({
   allowedHeaders: ['Content-Type','Authorization'],
   credentials: false
 }));
-// Let preflight OPTIONS succeed
 app.options('*', cors());
 
+/* ── Basics ───────────────────────────────────────────────────── */
 app.use(helmet());
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('tiny'));
 
-/* ── files ── */
-const ROOT        = process.cwd();
-const VAR_FILE    = path.join(ROOT, 'variants.json');     // REQUIRED
-const INDEX_FILE  = path.join(ROOT, 'meta_index.json');   // OPTIONAL
-const DB_FILE     = path.join(ROOT, 'db.json');
+/* ── Files ────────────────────────────────────────────────────── */
+const ROOT       = process.cwd();
+const VAR_FILE   = path.join(ROOT, 'variants.json');      // REQUIRED (array of {key, name?, cluster?, traitIcons?})
+const INDEX_FILE = path.join(ROOT, 'meta_index.json');    // OPTIONAL (array of full NFT metadata rows)
+const DB_FILE    = path.join(ROOT, 'db.json');            // auto-created
 
-if (!fs.existsSync(VAR_FILE))  fs.writeFileSync(VAR_FILE, '[]');
-if (!fs.existsSync(DB_FILE))   fs.writeFileSync(DB_FILE, JSON.stringify({ wallets: {} }, null, 2));
+if (!fs.existsSync(VAR_FILE)) fs.writeFileSync(VAR_FILE, '[]');
+if (!fs.existsSync(DB_FILE))  fs.writeFileSync(DB_FILE, JSON.stringify({ wallets: {} }, null, 2));
 
 const variants     = JSON.parse(fs.readFileSync(VAR_FILE, 'utf8'));
 const variantByKey = new Map(variants.map(v => [v.key, v]));
 
 /* optional local metadata index (by ASCII NFT name) */
-let NAME_INDEX = null; // { "FAMILY_1": {...}, ... }
+let NAME_INDEX = null;
 function loadNameIndex() {
-  if (!fs.existsSync(INDEX_FILE)) { NAME_INDEX = null; console.log('meta_index.json not found (optional)'); return; }
+  if (!fs.existsSync(INDEX_FILE)) { NAME_INDEX = null; return; }
   try {
     const rows = JSON.parse(fs.readFileSync(INDEX_FILE, 'utf8'));
     NAME_INDEX = Object.fromEntries(rows.map(r => [String(r.name), r]));
@@ -77,53 +64,49 @@ function loadNameIndex() {
 }
 loadNameIndex();
 
-/* ── caches ── */
-const accCache  = new LRUCache({ max: 500,  ttl: 1000 * 30 });        // stake -> rows (30s)
-const infoCache = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 });   // unit  -> info (1h)
+/* ── Caches ───────────────────────────────────────────────────── */
+const accCache  = new LRUCache({ max: 500,  ttl: 1000 * 30 });        // stake -> asset rows (30s)
+const infoCache = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 });   // unit  -> asset info (1h)
 
-/* ── helpers ── */
+/* ── Helpers ──────────────────────────────────────────────────── */
 const hexToAscii = (hex) => {
   if (!hex) return '';
   try { return decodeURIComponent(hex.replace(/[0-9a-f]{2}/gi, '%$&')); }
   catch { return ''; }
 };
 const ipfs = (u) => u?.startsWith('ipfs://') ? ('https://cloudflare-ipfs.com/ipfs/' + u.slice(7)) : u;
-
 const readDB  = () => JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
 const writeDB = (d) => fs.writeFileSync(DB_FILE, JSON.stringify(d, null, 2));
 
-/** accept stake1 / addr1 / hex (stake key hash or raw address bytes) -> stake1… */
+/** Normalize incoming address: accept stake1/addr1/hex → return stake1… */
 async function toStakeAddress(maybe) {
   if (!maybe) return null;
 
-  // bech32 inputs
+  // bech32
   if (maybe.startsWith('stake1')) return maybe;
   if (maybe.startsWith('addr1')) {
     const info = await api.addresses(maybe);
     return info?.stake_address || null;
   }
 
-  // hex inputs
+  // hex (28 = stake key hash, else full addr bytes)
   const isHex = (s) => typeof s === 'string' && /^[0-9a-f]+$/i.test(s);
   if (!isHex(maybe)) return null;
 
   const bytes = Buffer.from(maybe, 'hex');
 
-  // 28-byte stake key hash → make reward address
   if (bytes.length === 28) {
-    const header = (14 << 4) | (NETWORK_ID & 0x0f); // 0b1110nnnn
+    const header = (14 << 4) | (NETWORK_ID & 0x0f); // reward addr header
     const reward = Buffer.concat([Buffer.from([header]), bytes]);
     return bech32.encode(NETWORK_ID === 1 ? 'stake' : 'stake_test', bech32.toWords(reward));
   }
 
-  // full address bytes
   if (bytes.length >= 29) {
     const type = bytes[0] >> 4;
     const net  = bytes[0] & 0x0f;
-    const prefix =
-      type === 14
-        ? (net === 1 ? 'stake' : 'stake_test')
-        : (net === 1 ? 'addr'  : 'addr_test');
+    const prefix = type === 14
+      ? (net === 1 ? 'stake' : 'stake_test')
+      : (net === 1 ? 'addr'  : 'addr_test');
 
     const bech = bech32.encode(prefix, bech32.toWords(bytes));
     if (bech.startsWith('stake1')) return bech;
@@ -174,7 +157,7 @@ function extractNumber(info, fallbackUnitTail = true) {
   return '';
 }
 
-/* core: list all assets under policy for this stake */
+/* list all assets for stake and filter to our policy */
 async function listPolicyUnits(stake, { force = false } = {}) {
   let rows = !force ? accCache.get(stake) : null;
   if (!rows) {
@@ -191,7 +174,7 @@ async function listPolicyUnits(stake, { force = false } = {}) {
     .filter(u => POLICY_ID ? u.startsWith(POLICY_ID) : true);
 }
 
-/* build tallies for all variants.json keys (single call summary) */
+/* build tallies for ALL variants (summary for tiles) */
 async function computeHoldings(stake, { force = false } = {}) {
   const units = await listPolicyUnits(stake, { force });
 
@@ -234,78 +217,12 @@ async function computeHoldings(stake, { force = false } = {}) {
   return { units, tallies };
 }
 
-/* ── simple JWT (optional) ── */
-// In MVP we do NOT enforce JWT on holdings/assets/reveal, but we provide auth endpoints and accept Bearer if present.
-const nonceStore = new Map(); // stake -> { nonceHex, ts }
-
-/* auth: challenge */
-app.get('/auth/challenge', async (req, res) => {
-  try {
-    const raw = String(req.query.addr || '').trim();
-    if (!raw) return res.status(400).json({ error: 'missing_addr' });
-    const stake = await toStakeAddress(raw);
-    if (!stake) return res.status(400).json({ error: 'bad_address' });
-
-    const nonce = crypto.randomBytes(32);
-    const nonceHex = nonce.toString('hex');
-    const payload = `OldMoney: sign to authenticate\nstake:${stake}\nnonce:${nonceHex}`;
-    const payloadHex = Buffer.from(payload, 'utf8').toString('hex');
-
-    nonceStore.set(stake, { nonceHex, ts: Date.now() });
-    res.json({ stake, payload, payloadHex });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'challenge_failed' });
-  }
-});
-
-/* auth: verify */
-app.post('/auth/verify', async (req, res) => {
-  try {
-    const { addr, key, signature, payloadHex } = req.body || {};
-    if (!addr || !key || !signature || !payloadHex) return res.status(400).json({ error: 'missing_params' });
-
-    const stake = await toStakeAddress(addr);
-    if (!stake) return res.status(400).json({ error: 'bad_address' });
-
-    const rec = nonceStore.get(stake);
-    if (!rec) return res.status(400).json({ error: 'no_challenge' });
-    if (Date.now() - rec.ts > 5 * 60 * 1000) { nonceStore.delete(stake); return res.status(400).json({ error: 'challenge_expired' }); }
-
-    let verified = false;
-    try {
-      // ⚠️ Minimal/raw check (NOT full COSE). Many wallets will fail here.
-      const pubKey = Cardano.PublicKey.from_bytes(Buffer.from(key, 'hex'));
-      const sig    = Cardano.Ed25519Signature.from_bytes(Buffer.from(signature, 'hex'));
-      verified     = pubKey.verify(Buffer.from(payloadHex, 'hex'), sig);
-    } catch (e) {
-      verified = false;
-    }
-
-    if (!verified && STRICT_AUTH) {
-      return res.status(401).json({ error: 'bad_signature' });
-    }
-
-    if (!verified) {
-      console.warn('SIGN VERIFY FALLBACK: issuing token without full COSE verification (dev mode).');
-    }
-
-    const token = jwt.sign({ stake }, JWT_SECRET, { expiresIn: AUTH_TTL });
-    nonceStore.delete(stake);
-    res.json({ ok: true, token, stake, expiresIn: AUTH_TTL, dev_mode: !verified });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'verify_failed' });
-  }
-});
-
-
-/* ── routes ── */
-app.get('/health',  (_req, res) => res.json({ ok: true, policy: POLICY_ID ? 'set' : 'unset' }));
-app.get('/variants',(_req, res) => res.json(variants));
+/* ── ROUTES ───────────────────────────────────────────────────── */
+app.get('/health', (_req, res) => res.json({ ok: true, policy: POLICY_ID ? 'set' : 'unset' }));
+app.get('/variants', (_req, res) => res.json(variants));
 app.post('/index/reload', (_req, res) => { loadNameIndex(); res.json({ ok: true, rows: NAME_INDEX ? Object.keys(NAME_INDEX).length : 0 }); });
 
-/* holdings summary (one call for all variants) */
+/* holdings summary for all variants */
 app.get('/holdings/:addr', async (req, res) => {
   try {
     const raw   = String(req.params.addr || '').trim();
@@ -357,10 +274,10 @@ app.get('/assets/:addr/:variantKey', async (req, res) => {
 
       const ascii = hexToAscii(info.asset_name || '');
       const local = resolveFromLocalByName(ascii);
-      const isMatch =
+      const match =
         (local && String(local.variantKey).toUpperCase() === String(variantKey).toUpperCase())
         || matchVariantOnchain(variantKey, info);
-      if (!isMatch) continue;
+      if (!match) continue;
 
       items.push({
         unit,
@@ -376,25 +293,38 @@ app.get('/assets/:addr/:variantKey', async (req, res) => {
   }
 });
 
-/* persist reveal state */
+/* persist reveal with **server-side ownership check** */
 app.post('/reveal', async (req, res) => {
-  let { stake, variantKey } = req.body || {};
-  if (!stake || !variantKey) return res.status(400).json({ error: 'missing_params' });
+  try {
+    let { stake, variantKey } = req.body || {};
+    if (!stake || !variantKey) return res.status(400).json({ error: 'missing_params' });
 
-  const stakeAddr = await toStakeAddress(stake);
-  if (!stakeAddr) return res.status(400).json({ error: 'bad_address' });
-  if (!variantByKey.has(variantKey)) return res.status(404).json({ error: 'unknown_variant' });
+    const stakeAddr = await toStakeAddress(stake);
+    if (!stakeAddr) return res.status(400).json({ error: 'bad_address' });
 
-  const db  = readDB();
-  const now = new Date().toISOString();
-  const rec = db.wallets[stakeAddr] || { reveals: [], first_seen: now };
-  if (!rec.reveals.includes(variantKey)) rec.reveals.push(variantKey);
-  rec.last_seen = now;
-  db.wallets[stakeAddr] = rec;
-  writeDB(db);
+    const v = variantByKey.get(variantKey);
+    if (!v) return res.status(404).json({ error: 'unknown_variant' });
 
-  res.json({ ok: true, reveals: rec.reveals });
+    // ✅ ensure caller really holds at least 1 of this variant (prevents fake POSTs)
+    const { tallies } = await computeHoldings(stakeAddr, { force: false });
+    if ((tallies?.[variantKey]?.count || 0) < 1) {
+      return res.status(403).json({ error: 'not_holder' });
+    }
+
+    const db  = readDB();
+    const now = new Date().toISOString();
+    const rec = db.wallets[stakeAddr] || { reveals: [], first_seen: now };
+    if (!rec.reveals.includes(variantKey)) rec.reveals.push(variantKey);
+    rec.last_seen = now;
+    db.wallets[stakeAddr] = rec;
+    writeDB(db);
+
+    res.json({ ok: true, reveals: rec.reveals });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'reveal_failed' });
+  }
 });
 
-/* start */
+/* ── start ────────────────────────────────────────────────────── */
 app.listen(PORT, () => console.log(`stamps backend listening on :${PORT}`));
