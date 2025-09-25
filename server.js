@@ -74,7 +74,7 @@ const hexToAscii = (hex) => {
   try { return decodeURIComponent(hex.replace(/[0-9a-f]{2}/gi, '%$&')); }
   catch { return ''; }
 };
-const ipfs = (u) => u?.startsWith('ipfs://') ? ('https://cloudflare-ipfs.com/ipfs/' + u.slice(7)) : u;
+const ipfs = (u) => u?.startsWith('ipfs://') ? ('https://ipfs.blockfrost.dev/ipfs/' + u.slice(7)) : u;
 const readDB  = () => JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
 const writeDB = (d) => fs.writeFileSync(DB_FILE, JSON.stringify(d, null, 2));
 
